@@ -328,3 +328,131 @@ int main(void) {
             free(expanded);
             continue;
         }
+
+        if (spawn_pid == 0) {
+            /*Thsi is in the child process, so everything here only affects
+               the child, not the parent shell. 
+               As dicussed above, the child inherited copies of the parent's signal dispositions, file descriptors, environment, and etc*/
+
+            /* for foreground children we need to restore the default SIGINT behavior so Ctrl-C actually kills them. 
+               So the parent set SIGINT to SIG_IGN, and children inherit that, adn without this override foreground commands would be unkillable with Ctrl-C. 
+               Also, the background children keep SIG_IGN because we don't want Ctrl-C killing background jobs. */
+            if (!background) {
+                struct sigaction sa_child_int = {0};
+                sa_child_int.sa_handler = SIG_DFL;
+                sigfillset(&sa_child_int.sa_mask);
+                sa_child_int.sa_flags = 0;
+                sigaction(SIGINT, &sa_child_int, NULL);
+            }
+
+            /* all children (btoh the foreground and background), ignore SIGTSTP. */
+            struct sigaction sa_child_tstp = {0};
+            sa_child_tstp.sa_handler = SIG_IGN;
+            sigfillset(&sa_child_tstp.sa_mask);
+            sa_child_tstp.sa_flags = 0;
+            sigaction(SIGTSTP, &sa_child_tstp, NULL);
+
+            /* This is the input redirection: if the user gave us a file with <, we open it read-only and then use dup2 to make stdin
+               point to that file instead of the terminal. dup2(fd_in, STDIN_FILENO) closes the old stdin and makes fd 0 a copy of fd_in, so any
+               subsequent reads from stdin actually read from our file. 
+               We also close the original fd_in after because to avodi any redundantcy, sicne stdin itself is the file. i
+               If cans of the background process when the user didn't specify an input file, we redirect stdin to /dev/null instead, sicne we need to 
+               make sure tht the background processes is not trying to read from the terminal while the shell is also using it. 
+               Fianlly, if open fails we print an error and exit(1) from the child so the parent can pick up the failure via waitpid. */
+            if (input_file != NULL) {
+                int fd_in = open(input_file, O_RDONLY);
+                if (fd_in == -1) {
+                    fprintf(stderr, "cannot open %s for input\n", input_file);
+                    exit(1);
+                }
+                if (dup2(fd_in, STDIN_FILENO) == -1) {
+                    perror("dup2 stdin");
+                    exit(1);
+                }
+                close(fd_in);
+            } else if (background) {
+                int fd_devnull = open("/dev/null", O_RDONLY);
+                if (fd_devnull == -1) {
+                    perror("open /dev/null");
+                    exit(1);
+                }
+                dup2(fd_devnull, STDIN_FILENO);
+                close(fd_devnull);
+            }
+
+            /* Thsi is the output redirection, whcih uses the same idea as input but for stdout (fd 1).
+               SO O_WRONLY means write-only, O_CREAT creates the file if it doesn't exist, O_TRUNC empties the file if it does exist. 
+               
+               *the 0644 is the permission bits (rw-r--r--) for newly created files.
+
+               Agian, here the idea is that the background processes with no output file get their stdout sent
+               to /dev/null so they don't dump output into the terminal while the user is typing commands.  */
+            if (output_file != NULL) {
+                int fd_out = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd_out == -1) {
+                    fprintf(stderr, "cannot open %s for output\n", output_file);
+                    exit(1);
+                }
+                if (dup2(fd_out, STDOUT_FILENO) == -1) {
+                    perror("dup2 stdout");
+                    exit(1);
+                }
+                close(fd_out);
+            } else if (background) {
+                int fd_devnull = open("/dev/null", O_WRONLY);
+                if (fd_devnull == -1) {
+                    perror("open /dev/null");
+                    exit(1);
+                }
+                dup2(fd_devnull, STDOUT_FILENO);
+                close(fd_devnull);
+            }
+
+            /* execvp replaces this entire child process with the specified program. 
+               The 'v' means we pass arguments as an array (args), and the 'p' means it searches PATH for the command so the user
+               can type "ls" instead of "/bin/ls". And if execvp succeeds, the code below it never runs because this process is now a completely
+               different program. However, if it fails (command doesn't exist, bad
+               permissions, whatever), it returns -1 and,s ot aht we cna fall through to the
+               error message. */
+            execvp(args[0], args);
+
+            fprintf(stderr, "%s: no such file or directory\n", args[0]);
+            exit(1);
+        }
+
+        /* back in the parent process after fork. */
+        if (!background) {
+            /* This is a foreground command: waitpid with flags=0 blocks until the child terminates. t
+            So waitpid with flags=0 blocks until the child terminates (that's what makes it foreground), the shell just waits. 
+            But then once it returns, we can check how the child died: WIFEXITED/WEXITSTATUS for normal exits and their exit code, WIFSIGNALED/WTERMSIG for signal kills and which signal. 
+            We then store this for the status built-in and if a signal killed it, we also print the signal number right away. */
+            int child_status;
+            waitpid(spawn_pid, &child_status, 0);
+
+            if (WIFEXITED(child_status)) {
+                last_fg_status = WEXITSTATUS(child_status);
+                last_fg_signal = -1;
+            } else if (WIFSIGNALED(child_status)) {
+                last_fg_signal = WTERMSIG(child_status);
+                last_fg_status = 0;
+                printf("terminated by signal %d\n", last_fg_signal);
+                fflush(stdout);
+            }
+        } else {
+            /* background command: printing the PID and stash it in our tracking array. 
+               The the child runs on its own and we'll pick up its termination status in check_background_processes
+               at the top of the next loop iteration via waitpid with WNOHANG. */
+            printf("background pid is %d\n", spawn_pid);
+            fflush(stdout);
+            if (bg_count < MAX_BG_PROCS) {
+                bg_pids[bg_count++] = spawn_pid;
+            }
+        }
+
+        free(expanded);
+    }
+
+    /* Fianlign cleaning up of all the processes */
+    kill_all_background();
+    return 0;
+}
