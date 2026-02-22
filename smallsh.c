@@ -220,3 +220,111 @@ int main(void) {
         if (cmd_line[0] == '#') {
             continue;
         }
+
+
+        /* expand $$ to the shell's PID everywhere in the command string */
+        char *expanded = expand_dollar_dollar(cmd_line, shell_pid);
+
+        /* tokenize the command string. we need to pull out the command name and its arguments (goes into args[]), any input/output redirection
+           files (< and > operators), and whether it should run in the background (& at the end). strtok_r is the reentrant version of
+           strtok. For al fo that is uses the saveptr, sicne it allows us to give it to track its position instead of internal static state.
+           Basisiclay, the spec guarantees ordering of command first, then args, then redirection, then &, so if there are soem wired cases (agian, I'm not sure it 
+           that's soe thign that we had to account for) then we dont have to build in any addional handaling for them. */
+        char *input_file = NULL;
+        char *output_file = NULL;
+        int background = 0;
+        int arg_count = 0;
+
+        char *saveptr;
+        char *token = strtok_r(expanded, " ", &saveptr);
+        while (token != NULL) {
+            if (strcmp(token, "<") == 0) {
+                /* the token after < is the input file path */
+                token = strtok_r(NULL, " ", &saveptr);
+                input_file = token;
+            } else if (strcmp(token, ">") == 0) {
+                /* the token after > is the output file path */
+                token = strtok_r(NULL, " ", &saveptr);
+                output_file = token;
+            } else if (strcmp(token, "&") == 0) {
+                /* & should only appear as the very last token. */
+                char *next = strtok_r(NULL, " ", &saveptr);
+                if (next == NULL) {
+                    background = 1;
+                } else {
+                    args[arg_count++] = token;
+                    token = next;
+                    continue;
+                }
+            } else {
+                args[arg_count++] = token;
+            }
+            token = strtok_r(NULL, " ", &saveptr);
+        }
+        /* execvp needs a NULL-terminated argv array */
+        args[arg_count] = NULL;
+
+        if (arg_count == 0) {
+            free(expanded);
+            continue;
+        }
+
+        /* if foreground-only mode is on (from SIGTSTP toggle), ignore & */
+        if (foreground_only_mode) {
+            background = 0;
+        }
+
+        /* kills all background children and terminate. */
+        if (strcmp(args[0], "exit") == 0) {
+            kill_all_background();
+            free(expanded);
+            exit(0);
+        }
+
+        /* built-in: cd. chdir() is the syscall that changes the current working
+           directory for this process, so with an argument we cd to that path, without one we go to $HOME. 
+           getenv("HOME") pulls the home directory ath from the environment variables. chdir only affects this process, so
+           the child processes forked later will inherit whatever cwd we've set. */
+        if (strcmp(args[0], "cd") == 0) {
+            if (arg_count > 1) {
+                if (chdir(args[1]) != 0) {
+                    perror("cd");
+                }
+            } else {
+                char *home = getenv("HOME");
+                if (home != NULL) {
+                    if (chdir(home) != 0) {
+                        perror("cd");
+                    }
+                }
+            }
+            free(expanded);
+            continue;
+        }
+
+        /* built-in: status prints the exit code or signal number of the last
+           foreground command,so if nothing has run yet, last_fg_status is 0 by default
+           and last_fg_signal is -1 (meaning no signal), so it prints "exit value 0" which is correct per the specficoans that we were givn int he assimgant. */
+        if (strcmp(args[0], "status") == 0) {
+            if (last_fg_signal >= 0) {
+                printf("terminated by signal %d\n", last_fg_signal);
+            } else {
+                printf("exit value %d\n", last_fg_status);
+            }
+            fflush(stdout);
+            free(expanded);
+            continue;
+        }
+
+        /* for everything that isn't a built-in we fork a child process, sot aht the fork() creates an almost-exact copy of the current process. 
+           Spesially, it returns 0 in the new child, the child's PID in the parent, or -1 if something went wrong (like the system is out of process
+           slots). Them after this point we have two processes running the same code, and we can use the return value to figure out which one we are. */
+        pid_t spawn_pid = fork();
+
+        if (spawn_pid == -1) {
+            perror("fork");
+            last_fg_status = 1;
+            last_fg_signal = -1;
+            free(expanded);
+            continue;
+        }
