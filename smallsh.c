@@ -12,7 +12,7 @@
 #include <fcntl.h>
 #include <errno.h>
 
-/* I was not sure what exactly I meant by “a lot of comments,” so I went to the extent of being as detailed as I could, just to be safe.
+/* I was not sure what exactly I meant by a lot of comments and deantils expalions, so I went to the extent of being as detailed as I could, just to be safe.
 I have a bit of dyslexia, so if there are any minor spelling mistakes, I apologize. */
 
 
