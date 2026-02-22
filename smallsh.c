@@ -1,0 +1,101 @@
+/* Alina Hyk for HW3 in CS374 */
+
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+
+/* I was not sure what exactly I meant by “a lot of comments,” so I went to the extent of being as detailed as I could, just to be safe.
+I have a bit of dyslexia, so if there are any minor spelling mistakes, I apologize. */
+
+
+/* max command length is 2048 chars per the spec, plus one for the null
+   terminator; thw args cap is generous since spec only requires 20 but 512
+   costs us basically nothing. bg procs cap is just to prevent unbounded
+   array growth. */
+#define MAX_CMD_LENGTH 2049
+#define MAX_ARGS 512
+#define MAX_BG_PROCS 256
+
+/* this is the global that the SIGTSTP handler toggles to switch between normal mode and foreground-only mode. it has to be volatile sig_atomic_t and not
+   just a regular int because signal handlers are asynchronous, meanign that they can fire at any point during 
+   the execution, even in the middle of reading or writing a variable. 
+   So the volatile premvents it form cosnotly tryign to optimize it.
+   sig_atomic_t guarantees that reads and writes are atomic so we can't get a half-written value and the
+   handler sets it to 0 or 1, and the main loop checks it before deciding
+   whether to honor the & background flag.
+   So in retuslt we don't modify it anywhere else in the program, just check it, which avoids reentrancy issues. */
+volatile sig_atomic_t foreground_only_mode = 0;
+
+/* just a flat array to keep track of background child PIDs (every time we fork
+   a background process we add its PID here, and at the top of every loop
+   iteration we scan through and waitpid with WNOHANG to see if any of them
+   finished) */
+pid_t bg_pids[MAX_BG_PROCS];
+int bg_count = 0;
+
+/* this is the signal handler for SIGTSTP, which gets sent when the user presses Ctrl-Z. 
+All it does is flip the foreground_only_mode flag and print a message saying what happened.  */
+void handle_SIGTSTP(int signo) {
+    if (foreground_only_mode == 0) {
+        char *message = "\nEntering foreground-only mode (& is now ignored)\n";
+        write(STDOUT_FILENO, message, 50);
+        foreground_only_mode = 1;
+    } else {
+        char *message = "\nExiting foreground-only mode\n";
+        write(STDOUT_FILENO, message, 30);
+        foreground_only_mode = 0;
+    }
+}
+
+/* handles the $$ -> PID expansion that the spec requires. the approach is two passes over the string:
+   first pass just counts how many "$$" pairs exist so  we know how much memory to allocate: what we do is each "$$" is 2 chars that gets replaced
+   by the PID string which could be anywhere from 1 to like 7 chars, so the output string might be bigger or smaller than the input. 
+   second pass then actually builds the output by walking through the input char by char (follwign structre above, when we see
+   two $ in a row we copy the PID string instead, otherwise we just copy the char). 
+   This allows us to correctly handle the left-to-right scanning the spec wants, 
+   so for instce, "foo$$$" with PID 179 becomes "foo179$" because the first two $ pair up and  the third one is left alone. 
+   Fucnion returns a malloc'd string that the caller needs to free when they're done with it. */
+char *expand_dollar_dollar(const char *input, pid_t shell_pid) {
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", shell_pid);
+    int pid_len = strlen(pid_str);
+
+    /* count how many $$ pairs we need to replace. strstr finds the next
+       occurrence and we jump past it by 2 so $$$$ counts as two pairs. */
+    int count = 0;
+    const char *p = input;
+    while ((p = strstr(p, "$$")) != NULL) {
+        count++;
+        p += 2;
+    }
+
+    int new_len = strlen(input) + count * (pid_len - 2) + 1;
+    char *result = malloc(new_len);
+    if (!result) {
+        perror("malloc");
+        exit(1);
+    }
+
+    /* second pass builds the actual expanded string */
+    const char *src = input;
+    char *dst = result;
+    while (*src) {
+        if (src[0] == '$' && src[1] == '$') {
+            memcpy(dst, pid_str, pid_len);
+            dst += pid_len;
+            src += 2;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    return result;
+}
