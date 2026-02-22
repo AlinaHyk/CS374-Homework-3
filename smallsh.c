@@ -99,3 +99,55 @@ char *expand_dollar_dollar(const char *input, pid_t shell_pid) {
     *dst = '\0';
     return result;
 }
+
+/* this will run at the top of every loop iteration to check whether any background
+   processes have finished. I am using WNOHANG so that we can do the return immediately:
+   spesifialy, it returns the child's PID if the child is done, or 0 if it's still running, or -1 on error. 
+   This is imporant bacause we then can just quickly scan through all our tracked background PIDs without blocking.
+   
+   Also, when a child has terminated we need to figure out how it terminated and print the right message. 
+   I'm using WIFEXITED which checks if it exited normally (called exit() or
+   returned from main), and if so WEXITSTATUS gives us the exit code. 
+   Spesially, agian, WIFSIGNALED checks if it was killed by a signal, and WTERMSIG gives the actual signal number.
+
+   Fianlly, for the removal from the array i do a swap-and-shrink by replacing the terminated
+   PID with the last element in the array and decrement the count (incrementing i after a
+   swap because the element we just moved into position i hasn't been checked yet). */
+void check_background_processes(void) {
+    int i = 0;
+    while (i < bg_count) {
+        int child_status;
+        pid_t result = waitpid(bg_pids[i], &child_status, WNOHANG);
+        if (result > 0) {
+            if (WIFEXITED(child_status)) {
+                printf("background pid %d is done: exit value %d\n",
+                       bg_pids[i], WEXITSTATUS(child_status));
+            } else if (WIFSIGNALED(child_status)) {
+                printf("background pid %d is done: terminated by signal %d\n",
+                       bg_pids[i], WTERMSIG(child_status));
+            }
+            fflush(stdout);
+            bg_pids[i] = bg_pids[bg_count - 1];
+            bg_count--;
+        } else {
+            i++;
+        }
+    }
+}
+
+
+/* This will send SIGKILL to every background process we're tracking. 
+   When the user runs exitk, the kill() sends a signal to a given PID, and SIGKILL (signal 9)
+   is special because the target process can't catch or ignore it, since it's an
+   unconditional termination. */
+void kill_all_background(void) {
+    for (int i = 0; i < bg_count; i++) {
+        kill(bg_pids[i], SIGKILL);
+    }
+}
+
+int main(void) {
+    char cmd_line[MAX_CMD_LENGTH];
+    char *args[MAX_ARGS];
+    int last_fg_status = 0;
+    int last_fg_signal = -1;
