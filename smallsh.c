@@ -151,3 +151,72 @@ int main(void) {
     char *args[MAX_ARGS];
     int last_fg_status = 0;
     int last_fg_signal = -1;
+
+    /* getpid returns the PID of this process (after we got it the firt tiem we can reuse it
+       for all $$ expansions since it never changes). */
+    pid_t shell_pid = getpid();
+
+    /* setting up signal handling for SIGINT (Ctrl-C).
+       the parent shell ignores SIGINT entirely (sicne pressing Ctrl-C at the prompt
+       should do nothing to smallsh). The children inherit this SIG_IGN by default when we fork, which is what we want for background children, i belive. 
+       For foreground children however, we'll override it back to SIG_DFL so they die on Ctrl-C like normal. 
+       Sigfillset on sa_mask means basily soemthing like "block every other signal for now since this handler is active"; Not sure if 
+       it is required for the code, but I added to mke sure everythign is clean. */
+    struct sigaction sa_sigint = {0};
+    sa_sigint.sa_handler = SIG_IGN;
+    sigfillset(&sa_sigint.sa_mask);
+    sa_sigint.sa_flags = 0;
+    sigaction(SIGINT, &sa_sigint, NULL);
+
+    /* setting up SIGTSTP (Ctrl-Z) to use our custom handler that toggles foreground-only mode. 
+       the SA_RESTART flag is used so that if the user presses Ctrl-Z while we will nto be sitting inside fgets
+       waiting for input, as if it woudl have been otherwise, isntd, due to SA_RESTART flag fgets gets interrupted by the signal handler 
+       and when the handler returns, fgets would return NULL with errno set to EINTR (instead agian of continuing to wait for input). 
+       SA_RESTART also nciely tells the kernel to just restart the fgets call automatically after the handler finishes. 
+       sigfillset allows to block other signals during the handler, which matters because the handler modifies the
+       foreground_only_mode global and we don't want to get interrupted in the middle of that toggle, so that was the rational for that part. */
+    struct sigaction sa_sigtstp = {0};
+    sa_sigtstp.sa_handler = handle_SIGTSTP;
+    sigfillset(&sa_sigtstp.sa_mask);
+    sa_sigtstp.sa_flags = SA_RESTART;
+    sigaction(SIGTSTP, &sa_sigtstp, NULL);
+
+    /* main shell loop. runs until the user types exit or we hit EOF. */
+    while (1) {
+        /* check on background processes before prompting (this is where the
+           "background pid X is done" messages show up) */
+        check_background_processes();
+
+        /* print the colon prompt. 
+           fflush is necessary here becausa stdout is line-buffered by default, so without a newline character the colon
+           would just sit in the buffer and the user wouldn't see it. */
+        printf(":");
+        fflush(stdout);
+
+        /* thsi part reads user input. 
+           I used memset as calening, sicne it zeros out the buffer first so we have a
+           clean slate. fgets then reads up to MAX_CMD_LENGTH-1 chars and null- terminates; it returns NULL on either EOF 
+           (Ctrl-D or end of redirected input) or on error (like EINTR from a signal, though SA_RESTART should handle most of those). 
+           Then for EOF we break out of the loop, and for errors we clearerr so stdin works again and reprompts. */
+        memset(cmd_line, '\0', MAX_CMD_LENGTH);
+        if (fgets(cmd_line, MAX_CMD_LENGTH, stdin) == NULL) {
+            if (feof(stdin)) {
+                break;
+            }
+            clearerr(stdin);
+            printf("\n");
+            continue;
+        }
+
+        /* strips the trailing newline that fgets includes */
+        size_t len = strlen(cmd_line);
+        if (len > 0 && cmd_line[len - 1] == '\n') {
+            cmd_line[len - 1] = '\0';
+        }
+
+        if (strlen(cmd_line) == 0) {
+            continue;
+        }
+        if (cmd_line[0] == '#') {
+            continue;
+        }
